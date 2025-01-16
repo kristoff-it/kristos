@@ -4,17 +4,203 @@ const bss = @extern([*]u8, .{ .name = "__bss" });
 const bss_end = @extern([*]u8, .{ .name = "__bss_end" });
 const stack_top = @extern([*]u8, .{ .name = "__stack_top" });
 
+const ram_start = @extern([*]u8, .{ .name = "__free_ram" });
+const ram_end = @extern([*]u8, .{ .name = "__free_ram_end" });
+
+const page_size = 4096;
+var used_mem: usize = 0;
+fn allocPages(pages: usize) []u8 {
+    const ram = ram_start[0 .. @intFromPtr(ram_end) - @intFromPtr(ram_start)];
+    const alloc_size = pages * page_size;
+
+    if (used_mem + alloc_size > ram.len) {
+        @panic("out of memory");
+    }
+
+    const result = ram[used_mem..alloc_size];
+    used_mem += alloc_size;
+
+    @memset(result, 0);
+
+    return result;
+}
+
+const Process = struct {
+    pid: usize = 0,
+    state: enum { unused, runnable } = .unused,
+    sp: *usize = undefined, // stack pointer
+    stack: [1024]u8 align(4) = undefined,
+};
+
+var procs = [_]Process{.{}} ** 8;
+
+fn createProcess(pc: *const anyopaque) *Process {
+    const p = for (&procs, 0..) |*p, i| {
+        if (p.state == .unused) {
+            p.pid = i;
+            break p;
+        }
+    } else @panic("too many processes!");
+
+    const regs: []usize = blk: {
+        const ptr: [*]usize = @alignCast(@ptrCast(&p.stack));
+        break :blk ptr[0 .. p.stack.len / @sizeOf(usize)];
+    };
+
+    const sp = regs[regs.len - 13 ..];
+    sp[0] = @intFromPtr(pc);
+
+    std.debug.assert(sp.len == 13);
+
+    for (sp[1..]) |*reg| {
+        reg.* = 0;
+    }
+
+    p.sp = &sp.ptr[0];
+    p.state = .runnable;
+    return p;
+}
+
+export fn processA() void {
+    console.print("starting process A\n\n", .{}) catch {};
+    while (true) {
+        console.print("A", .{}) catch {};
+        yield();
+        for (3_000_000_000) |_| asm volatile ("nop");
+    }
+}
+
+export fn processB() void {
+    console.print("starting process B\n\n", .{}) catch {};
+    while (true) {
+        console.print("B", .{}) catch {};
+        yield();
+        for (3_000_000_000) |_| asm volatile ("nop");
+    }
+}
+
+var current_proc: *Process = undefined;
+var idle_proc: *Process = undefined;
+
+noinline fn yield() void {
+    const start_idx = (current_proc.pid + 1) % procs.len;
+    const next = for (procs[start_idx..]) |*p| {
+        if (p.state == .runnable and p.pid > 0) {
+            break p;
+        }
+    } else for (procs[0..start_idx]) |*p| {
+        if (p.state == .runnable and p.pid > 0) {
+            break p;
+        }
+    } else idle_proc;
+
+    if (next == current_proc) return;
+
+    asm volatile (
+        \\csrw sscratch, %[sscratch]
+        :
+        : [sscratch] "r" (next.stack[0..].ptr[next.stack.len]),
+    );
+
+    const prev = current_proc;
+    current_proc = next;
+    context_switch(&prev.sp, &next.sp);
+}
+
+noinline fn context_switch(
+    cur: **usize,
+    next: **usize,
+) callconv(.C) void {
+    asm volatile (
+        \\addi sp, sp, -4 * 13
+        \\sw ra, 4 * 0(sp)
+        \\sw s0, 4 * 1(sp)
+        \\sw s1, 4 * 2(sp)
+        \\sw s2, 4 * 3(sp)
+        \\sw s3, 4 * 4(sp)
+        \\sw s4, 4 * 5(sp)
+        \\sw s5, 4 * 6(sp)
+        \\sw s6, 4 * 7(sp)
+        \\sw s7, 4 * 8(sp)
+        \\sw s8, 4 * 9(sp)
+        \\sw s9, 4 * 10(sp)
+        \\sw s10, 4 * 11(sp)
+        \\sw s11, 4 * 12(sp)
+        \\
+        \\sw sp, (%[cur])
+        \\lw sp, (%[next])
+        \\
+        \\lw ra, 4 * 0(sp)
+        \\lw s0, 4 * 1(sp)
+        \\lw s1, 4 * 2(sp)
+        \\lw s2, 4 * 3(sp)
+        \\lw s3, 4 * 4(sp)
+        \\lw s4, 4 * 5(sp)
+        \\lw s5, 4 * 6(sp)
+        \\lw s6, 4 * 7(sp)
+        \\lw s7, 4 * 8(sp)
+        \\lw s8, 4 * 9(sp)
+        \\lw s9, 4 * 10(sp)
+        \\lw s10, 4 * 11(sp)
+        \\lw s11, 4 * 12(sp)
+        \\addi sp, sp, 4 * 13
+        \\ret
+        :
+        : [cur] "r" (cur),
+          [next] "r" (next),
+    );
+}
+
 export fn kernel_main() noreturn {
+    main() catch |err| std.debug.panic("{s}", .{@errorName(err)});
+    while (true) asm volatile ("wfi");
+}
+
+fn main() !void {
     const bss_len = @intFromPtr(bss_end) - @intFromPtr(bss);
     @memset(bss[0..bss_len], 0);
 
     const hello = "Hello Kernel!\n";
-    console.print("{s}", .{hello}) catch {};
+    try console.print("{s}", .{hello});
 
-    write_csr("stvec", @intFromPtr(&kernel_entry));
-    asm volatile ("unimp");
+    // exception handling
+    {
+        write_csr("stvec", @intFromPtr(&kernel_entry));
+        // Uncomment to trigger a cpu exception
+        // asm volatile ("unimp");
+    }
 
-    while (true) asm volatile ("wfi");
+    // page allocation
+    {
+        const one = allocPages(1);
+        const two = allocPages(2);
+
+        try console.print("one: {*} ({}), two: {*} ({})", .{
+            one.ptr,
+            one.len,
+            two.ptr,
+            two.len,
+        });
+    }
+
+    // processes
+    {
+        idle_proc = createProcess(undefined);
+        _ = createProcess(&processA);
+        _ = createProcess(&processB);
+
+        current_proc = idle_proc;
+        yield();
+
+        @panic("switched to idle process");
+
+        // asm volatile (
+        //     \\mv sp, %[pAs]
+        //     \\call processA
+        //     :
+        //     : [pAs] "r" (pA.sp),
+        // );
+    }
 }
 
 pub fn panic(
@@ -25,7 +211,7 @@ pub fn panic(
     _ = error_return_trace;
     _ = ret_addr;
 
-    console.print("PANIC: {s}\n", .{msg}) catch {};
+    console.print("KERNEL PANIC: {s}\n", .{msg}) catch {};
     while (true) asm volatile ("");
 }
 
@@ -85,6 +271,8 @@ pub fn sbi(
 
 export fn kernel_entry() align(4) callconv(.Naked) void {
     asm volatile (
+        \\csrrw sp, sscratch, sp
+        \\
         \\addi sp, sp, -4 * 31
         \\sw ra, 4 * 0(sp)
         \\sw gp, 4 * 1(sp)
@@ -119,6 +307,13 @@ export fn kernel_entry() align(4) callconv(.Naked) void {
         \\
         \\addi a0, sp, 4 * 31
         \\sw a0, -4(a0)
+        \\
+        // Retrieve and save the sp at the time of exception.
+        \\csrr a0, sscratch
+        \\sw a0,  4 * 30(sp)
+        // Reset the kernel stack.
+        \\addi a0, sp, 4 * 31
+        \\csrw sscratch, a0       
         \\
         \\mv a0, sp
         \\call handle_trap
