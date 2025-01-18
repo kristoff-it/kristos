@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const kernel_base = @extern([*]u8, .{ .name = "__kernel_base" });
 const bss = @extern([*]u8, .{ .name = "__bss" });
 const bss_end = @extern([*]u8, .{ .name = "__bss_end" });
 const stack_top = @extern([*]u8, .{ .name = "__stack_top" });
@@ -17,7 +18,7 @@ fn allocPages(pages: usize) []u8 {
         @panic("out of memory");
     }
 
-    const result = ram[used_mem..alloc_size];
+    const result = ram[used_mem..][0..alloc_size];
     used_mem += alloc_size;
 
     @memset(result, 0);
@@ -29,6 +30,7 @@ const Process = struct {
     pid: usize = 0,
     state: enum { unused, runnable } = .unused,
     sp: *usize = undefined, // stack pointer
+    page_table: [*]PageEntry = undefined,
     stack: [1024]u8 align(4) = undefined,
 };
 
@@ -54,6 +56,26 @@ fn createProcess(pc: *const anyopaque) *Process {
 
     for (sp[1..]) |*reg| {
         reg.* = 0;
+    }
+
+    const page = allocPages(1);
+    p.page_table = @alignCast(@ptrCast(page));
+
+    console.print("new top level page table: {*}\n", .{page.ptr}) catch {};
+
+    const pages_count = @divFloor((@intFromPtr(ram_end) - @intFromPtr(kernel_base)), page_size);
+    const pages: [*][page_size]u8 = @ptrCast(kernel_base);
+
+    for (pages[0..pages_count]) |*paddr| {
+        const flags: PageEntry = .{
+            .read = true,
+            .write = true,
+            .execute = true,
+            .user = false,
+            .valid = false,
+        };
+
+        mapPage(p.page_table, @intFromPtr(paddr), @intFromPtr(paddr), flags);
     }
 
     p.sp = &sp.ptr[0];
@@ -96,10 +118,18 @@ noinline fn yield() void {
 
     if (next == current_proc) return;
 
+    // console.print("swapping active page table: {*}\n", .{next.page_table}) catch {};
+
+    const satp = Satp.fromPageTableAddr(next.page_table);
+    const satp_u32: u32 = @bitCast(satp);
     asm volatile (
+        \\sfence.vma
+        \\csrw satp, %[satp]
+        \\sfence.vma
         \\csrw sscratch, %[sscratch]
         :
-        : [sscratch] "r" (next.stack[0..].ptr[next.stack.len]),
+        : [satp] "r" (satp_u32),
+          [sscratch] "r" (next.stack[0..].ptr[next.stack.len]),
     );
 
     const prev = current_proc;
@@ -172,24 +202,29 @@ fn main() !void {
 
     // page allocation
     {
-        const one = allocPages(1);
-        const two = allocPages(2);
+        // const one = allocPages(1);
+        // const two = allocPages(2);
 
-        try console.print("one: {*} ({}), two: {*} ({})", .{
-            one.ptr,
-            one.len,
-            two.ptr,
-            two.len,
-        });
+        // try console.print("one: {*} ({}), two: {*} ({})\n", .{
+        //     one.ptr,
+        //     one.len,
+        //     two.ptr,
+        //     two.len,
+        // });
     }
 
     // processes
     {
+        try console.print("creating processes...\n", .{});
+
         idle_proc = createProcess(undefined);
         _ = createProcess(&processA);
         _ = createProcess(&processB);
 
         current_proc = idle_proc;
+
+        try console.print("processes created, yielding\n", .{});
+
         yield();
 
         @panic("switched to idle process");
@@ -409,4 +444,71 @@ fn write_csr(comptime reg: []const u8, val: usize) void {
         :
         : [val] "r" (val),
     );
+}
+
+// Virtual memory
+
+const Satp = packed struct {
+    reserved: u31,
+    sv32: bool,
+
+    fn fromPageTableAddr(pta: [*]PageEntry) Satp {
+        return .{
+            .reserved = @intCast(@intFromPtr(pta) >> 12),
+            .sv32 = true,
+        };
+    }
+};
+
+const PageEntry = packed struct(u32) {
+    valid: bool,
+    read: bool,
+    write: bool,
+    execute: bool,
+    user: bool,
+    other_flags: u5 = 0,
+    ppn: u22 = 0,
+};
+
+const Vpn = packed struct(u32) {
+    offset: u12,
+    zero: u10,
+    one: u10,
+};
+
+fn mapPage(
+    table1: [*]PageEntry,
+    vaddr: usize,
+    paddr: usize,
+    flags: PageEntry,
+) void {
+    // console.print("mapPage({*}, {x}, {x}, ...)\n", .{ table1, vaddr, paddr }) catch {};
+
+    if (vaddr % page_size != 0) {
+        std.debug.panic("unaligned vaddr: {}", .{vaddr});
+    }
+
+    if (paddr % page_size != 0) {
+        std.debug.panic("unaligned paddr: {}", .{paddr});
+    }
+
+    const vpn: Vpn = @bitCast(vaddr);
+
+    if (!table1[vpn.one].valid) {
+        var pt_addr: PageEntry = @bitCast(@intFromPtr(allocPages(1).ptr));
+
+        pt_addr.valid = true;
+        pt_addr.ppn >>= 2;
+        table1[vpn.one] = pt_addr;
+    }
+
+    const table0u32: u32 = @intCast(table1[vpn.one].ppn);
+    const table0: [*]PageEntry = @ptrFromInt(table0u32 << 12);
+
+    const paddr_as_pe: PageEntry = @bitCast((paddr / page_size) << 10);
+    var new_pe = flags;
+    new_pe.ppn = paddr_as_pe.ppn;
+    new_pe.valid = true;
+
+    table0[vpn.zero] = new_pe;
 }

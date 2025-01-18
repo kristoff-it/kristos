@@ -14,3 +14,6 @@ https://www.youtube.com/watch?v=eAM9ol7W2w8
 
 ### Day 2
 https://www.youtube.com/watch?v=_GczkjDvccE
+
+### Day 3
+https://www.youtube.com/watch?v=P34rpvL5Zkw
