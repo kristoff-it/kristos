@@ -10,9 +10,6 @@ Zig must be version 0.13.0, but it's possible to use 0.14.0 by just fixing a sin
 Depends on llvm-objcopy, but would be possible to remove that dependency once 
 Zig's own objcopy becomes feature complete enough.
 
-
-After that commit, the code was updated to Zig 0.14.0
-
 ## Book
 https://operating-system-in-1000-lines.vercel.app/en/
 
